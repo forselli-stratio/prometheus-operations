@@ -1,0 +1,102 @@
+#!/bin/bash
+set -o errexit -o nounset -o pipefail
+
+source /usr/sbin/b-log.sh
+B_LOG --stdout true
+DOCKER_LOG_LEVEL=${DOCKER_LOG_LEVEL:-INFO}
+eval LOG_LEVEL_"${DOCKER_LOG_LEVEL}"
+
+ENABLE_ADMIN_API="${ENABLE_ADMIN_API:-true}"
+
+STORAGE_PATH=/prometheus
+[ -d /mnt/mesos/sandbox/prometheus ] && STORAGE_PATH=/mnt/mesos/sandbox/prometheus
+mkdir -p $STORAGE_PATH/server $STORAGE_PATH/alertmanager
+rm -f $STORAGE_PATH/server/lock
+
+if [ -n "${METRICS_PORT_NAME-}" ]; then
+  /bin/service_discovery -out "/etc/prometheus/services.json" -loop -time ${SERVICE_REFRESH_INTERVAL:-20} \
+                       -portname "$METRICS_PORT_NAME" &
+fi
+
+ADMIN_API_FLAG="--web.enable-admin-api"
+if [ "${ENABLE_ADMIN_API}" = false ]; then
+    ADMIN_API_FLAG=""
+fi
+
+# Getting secrets to connect to etcd
+if [ -z ${VAULT_ROLE_ID} ] || [ -z ${VAULT_SECRET_ID} ];  then
+  ERROR "No enviroment variables from sso plugin in marathon VAULT_ROLE_ID and VAULT_SECRET_ID defined"
+  exit 1
+elif [ -z ${STRING_VAULT_HOST} ] || [ -z ${VAULT_PORT} ]; then
+  ERROR "No enviroment variables STRING_VAULT_HOST and VAULT_PORT defined"
+  exit 2
+fi
+
+mkdir -p /etc/pki
+source /usr/sbin/kms_utils.sh
+
+OLD_IFS=${IFS}
+IFS=',' read -r -a VAULT_HOSTS <<< "$STRING_VAULT_HOST"
+IFS=${OLD_IFS}
+INFO "Dynamic login with vault"
+if login; then
+    INFO "Vault login successful"
+else
+    ERROR "Vault login failed"
+    exit 1
+fi
+
+if getCert userland prometheus prometheus-etcd PEM /etc/pki/; then
+    INFO "Prometheus certificate downloaded successfully"
+else
+    ERROR "Prometheus certificate download failed"                         
+    exit 1                                             
+fi
+
+if getCAbundle /etc/pki PEM; then
+    INFO "CA bundle downloaded successfully"         
+else                                                              
+    ERROR "CA bundle certificate download failed"                
+    exit 1                                                        
+fi  
+
+for file in "prometheus-etcd.pem" "prometheus-etcd.key" "ca-bundle.pem"; do
+    src_file_path=/etc/pki/$file.orig
+    dest_file_path=/etc/pki/$file
+    mv $dest_file_path $src_file_path
+    fold -w 64 $src_file_path > $dest_file_path
+done
+
+/token_renewer.sh 1>&2 &
+
+if [ -n "${EXTERNAL_TARGETS-}" ]; then 
+  /bin/echo "$EXTERNAL_TARGETS" | tr -s ' ' '\n' | sed -e "s/^\(.*\)$/\"\1\",/" | tr '\n' ' ' | sed -e 's/, $//' -e 's/^\(.*\)$/[{"targets":[\1]}]/' > /etc/prometheus/external_services.json
+fi
+
+/opt/confd/bin/confd -onetime \
+                     -backend etcd \
+                     -node https://etcd-client.service.${CONSUL_DOMAIN}:2379 \
+                     -client-ca-keys /etc/pki/ca-bundle.pem \
+                     -client-cert /etc/pki/prometheus-etcd.pem \
+                     -client-key /etc/pki/prometheus-etcd.key \
+                     -sync-only
+
+/bin/sed -i'' -e "s#@VAULT_TOKEN@#${VAULT_TOKEN}#" /etc/prometheus/prometheus.yml
+
+export VAULT_TOKEN
+
+/slow_start_confd.sh 1>&2 &
+
+/bin/alertmanager --config.file "/etc/prometheus/alertmanager.yml" \
+                  --storage.path "$STORAGE_PATH/alertmanager" &
+
+/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=$STORAGE_PATH/server \
+  --storage.tsdb.retention.time="${STORAGE_TSDB_RETENTION_TIME:-15d}" \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.route-prefix=/ \
+  --web.external-url=$EXTERNAL_URL \
+  $ADMIN_API_FLAG \
+  $@
